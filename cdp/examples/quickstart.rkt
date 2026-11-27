@@ -18,6 +18,9 @@
    (display-to-file "<html><head><title>cdp quickstart</title></head>
 <body style='margin:0;background:#2d6;color:#fff;font:48px sans-serif'>
 <div style='padding:40px'>Hello from <b>cdp</b></div></body></html>" page)
+   (with-handlers ([exn:fail? (lambda (e)
+                                (eprintf "quickstart: browser found but did not start: ~a\n" (exn-message e))
+                                (delete-directory/files dir))])
    (with-cdp
     (lambda (c)
       (cdp-navigate c (path->file-url page))
@@ -30,4 +33,4 @@
       (printf "screenshot ~a bytes, pdf ~a bytes\n"
               (file-size (build-path dir "shot.png"))
               (file-size (build-path dir "page.pdf")))))
-   (delete-directory/files dir)])
+   (delete-directory/files dir))])

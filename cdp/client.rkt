@@ -5,7 +5,7 @@
 ;; (evaluate, navigate, wait, screenshot, print to PDF).
 (require racket/file racket/format racket/list racket/port racket/string
          json net/base64
-         (file "websocket.rkt") (file "browser.rkt"))
+         (file "websocket.rkt") (file "browser.rkt") (file "launch.rkt"))
 (provide cdp
          (struct-out cdp)
          cdp-launch
@@ -31,34 +31,54 @@
                     #:args [args '()]
                     #:headless? [headless? #t]
                     #:timeout-ms [timeout-ms 30000])
-  (define profile (make-temporary-file "cdp-profile-~a" 'directory))
-  (define log (open-output-file (build-path profile "browser.log") #:exists 'truncate))
-  (define-values (proc _in _out _err)
-    (with-handlers ([exn:fail? (lambda (e) (delete-directory/files profile) (raise e))])
-      (apply subprocess #f #f log browser
-             (append (if headless? '("--headless=new" "--disable-gpu") '())
-                     '("--no-first-run" "--no-default-browser-check" "--disable-extensions"
-                       "--remote-debugging-port=0")
-                     (list (string-append "--user-data-dir=" (path->string profile)))
-                     args
-                     '("about:blank")))))
-  (define port-file (build-path profile "DevToolsActivePort"))
-  (define deadline (+ (current-inexact-milliseconds) timeout-ms))
-  ;; Chromium writes the file line by line; a complete second line is the
-  ;; browser endpoint path, so wait for it instead of trusting file existence.
-  (define (complete-port-lines)
-    (with-handlers ([exn:fail? (lambda (_) #f)])
-      (define ls (file->lines port-file))
-      (and (>= (length ls) 2)
-           (regexp-match? #px"^/devtools/browser/[0-9a-f-]{36}$" (second ls))
-           ls)))
-  (let wait ()
-    (cond [(complete-port-lines) => values]
-          [(> (current-inexact-milliseconds) deadline)
-           (subprocess-kill proc #t)
-           (error 'cdp-launch "browser did not open its DevTools port in time")]
-          [else (sleep 0.1) (wait)]))
-  (define lines (complete-port-lines))
+  (define (browser-log-tail profile)
+    (with-handlers ([exn:fail? (lambda (_) "")])
+      (define p (build-path profile "browser.log"))
+      (if (file-exists? p)
+          (string-join (take-right (file->lines p) (min 5 (length (file->lines p)))) "\n")
+          "")))
+  ;; One attempt per headless flag set: when the DevTools port does not show
+  ;; up in time, kill the browser, drop the profile and try the next set.
+  (define-values (proc profile lines)
+    (let try ([flag-sets (if headless? headless-flag-sets '(()))])
+      (unless (pair? flag-sets)
+        (error 'cdp-launch "browser did not open its DevTools port in time"))
+      (define profile (make-temporary-file "cdp-profile-~a" 'directory))
+      (define log (open-output-file (build-path profile "browser.log") #:exists 'truncate))
+      (define proc
+        (let-values ([(p _in _out _err)
+                      (with-handlers ([exn:fail? (lambda (e) (delete-directory/files profile) (raise e))])
+                        (apply subprocess #f #f log browser
+                               (append (first flag-sets)
+                                       '("--no-first-run" "--no-default-browser-check" "--disable-extensions"
+                                         "--remote-debugging-port=0")
+                                       (list (string-append "--user-data-dir=" (path->string profile)))
+                                       args
+                                       '("about:blank"))))])
+          p))
+      (define port-file (build-path profile "DevToolsActivePort"))
+      (define deadline (+ (current-inexact-milliseconds) timeout-ms))
+      ;; Chromium writes the file line by line; a complete second line is the
+      ;; browser endpoint path, so wait for it instead of trusting file existence.
+      (define (complete-port-lines)
+        (with-handlers ([exn:fail? (lambda (_) #f)])
+          (define ls (file->lines port-file))
+          (and (>= (length ls) 2)
+               (regexp-match? #px"^/devtools/browser/[0-9a-f-]{36}$" (second ls))
+               ls)))
+      (let wait ()
+        (cond [(complete-port-lines) => (lambda (ls) (values proc profile ls))]
+              [(> (current-inexact-milliseconds) deadline)
+               (define tail (browser-log-tail profile))
+               (subprocess-kill proc #t)
+               (subprocess-wait proc)
+               (delete-directory/files profile)
+               (if (null? (cdr flag-sets))
+                   (error 'cdp-launch
+                          "browser did not open its DevTools port in time~a"
+                          (if (non-empty-string? tail) (string-append "\n" tail) ""))
+                   (try (cdr flag-sets)))]
+              [else (sleep 0.1) (wait)]))))
   (define ws (ws-connect "127.0.0.1" (string->number (first lines)) (second lines)))
   (define c (cdp ws proc profile #f 0))
   (define target (cdp-call c "Target.createTarget" (hasheq 'url "about:blank")))
