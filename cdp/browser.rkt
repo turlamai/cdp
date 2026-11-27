@@ -55,7 +55,8 @@
 (define (find-browser)
   (or (let ([override (env-path "CDP_BROWSER")])
         (and override (file-exists? override) override))
-      (for/or ([p (in-list (known-paths))]) (and p (file-exists? p) (path->string p)))
+      (for/or ([p (in-list (known-paths))])
+        (and (file-exists? p) (if (string? p) p (path->string p))))
       (for/or ([name (in-list path-names)]) (define p (find-on-path name)) (and p (path->string p)))))
 
 (define (browser-error)
